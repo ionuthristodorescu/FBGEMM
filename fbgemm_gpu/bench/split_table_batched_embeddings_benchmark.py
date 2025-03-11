@@ -49,6 +49,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training_common import (
 )
 from fbgemm_gpu.tbe.bench import (
     bench_warmup,
+    benchmark_cpu_requests,
     benchmark_eval_compression,
     benchmark_pipelined_requests,
     benchmark_requests,
@@ -309,9 +310,7 @@ def device(  # noqa C901
                 )
                 for d in Ds
             ],
-            cache_precision=(
-                weights_precision if cache_precision is None else cache_precision
-            ),
+            cache_precision=cache_precision,
             cache_algorithm=CacheAlgorithm.LRU,
             cache_load_factor=cache_load_factor,
             **common_split_args,
@@ -976,24 +975,6 @@ def cache(  # noqa C901
         f"{3 * param_size_multiplier * B * sum(Ds) * L / forward_backward_time / 1.0e9: .2f} GB/s, "
         f"Te2e: {e2e_time * 1.0e6:.0f}us, "
     )
-
-
-def benchmark_cpu_requests(
-    requests: List[TBERequest],
-    func: Callable[[Tensor, Tensor, Optional[Tensor]], Tensor],
-    num_warmups: int = 0,
-) -> float:
-    import time
-
-    if num_warmups > 0:
-        for _ in range(num_warmups):
-            func(*(requests[0].unpack_3()))
-
-    start_time = time.perf_counter()
-    for req in requests:
-        func(*(req.unpack_3()))
-    end_time = time.perf_counter()
-    return (end_time - start_time) / len(requests)
 
 
 @cli.command()
@@ -3280,6 +3261,7 @@ def emb_inplace_update(  # noqa C901
 @click.option("--batch-size", default=512)
 @click.option("--embedding-dim-list", type=str, default="128")
 @click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
+@click.option("--cache-precision", type=SparseType, default=None)
 @click.option("--stoc", is_flag=True, default=False)
 @click.option("--iters", default=100)
 @click.option("--warmup-runs", default=0)
@@ -3299,6 +3281,7 @@ def device_with_spec(  # noqa C901
     batch_size: int,
     embedding_dim_list: str,
     weights_precision: SparseType,
+    cache_precision: Optional[SparseType],
     stoc: bool,
     iters: int,
     warmup_runs: int,
@@ -3387,6 +3370,7 @@ def device_with_spec(  # noqa C901
         learning_rate=0.1,
         eps=0.1,
         weights_precision=weights_precision,
+        cache_precision=cache_precision,
         stochastic_rounding=stoc,
         output_dtype=output_dtype,
         pooling_mode=pooling_mode,
