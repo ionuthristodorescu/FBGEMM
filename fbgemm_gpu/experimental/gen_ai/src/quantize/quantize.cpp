@@ -125,7 +125,11 @@ at::Tensor f8f8bf16_cublas(
 at::Tensor bf16_fast_gemv(at::Tensor X, at::Tensor W);
 at::Tensor
 bf16fp8bf16_fast_gemv(at::Tensor X, at::Tensor W, at::Tensor w_scale);
-at::Tensor fp8fp8bf16_fast_gemv(at::Tensor X, at::Tensor W, at::Tensor scale);
+at::Tensor fp8fp8bf16_fast_gemv(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor x_scale,
+    at::Tensor w_scale);
 
 at::Tensor f8i4bf16_rowwise(
     at::Tensor XQ,
@@ -139,6 +143,13 @@ at::Tensor f8i4bf16_shuffled(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor w_scale_group);
+at::Tensor f8i4bf16_shuffled_grouped(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor w_scale_group,
+    at::Tensor M_sizes);
 std::tuple<at::Tensor, at::Tensor> preshuffle_i4(
     at::Tensor WQ,
     at::Tensor w_scale);
@@ -201,10 +212,14 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "f8i4bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor");
   m.def(
       "f8i4bf16_shuffled(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group) -> Tensor");
+  m.def(
+      "f8i4bf16_shuffled_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group, Tensor M_sizes) -> Tensor");
+  m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
   m.def("preshuffle_i4(Tensor WQ, Tensor w_scale) -> (Tensor, Tensor)");
   m.def("bf16_fast_gemv(Tensor X, Tensor W) -> Tensor");
   m.def("bf16fp8bf16_fast_gemv(Tensor X, Tensor W, Tensor w_scale) -> Tensor");
-  m.def("fp8fp8bf16_fast_gemv(Tensor X, Tensor W, Tensor scale) -> Tensor");
+  m.def(
+      "fp8fp8bf16_fast_gemv(Tensor X, Tensor W, Tensor x_scale, Tensor w_scale) -> Tensor");
   m.def("f8f8bf16_lite(Tensor XQ, Tensor WQ, Tensor scale) -> Tensor");
   m.def(
       "bf16i4bf16_rowwise(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
@@ -291,6 +306,7 @@ TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
   m.impl("f8f8bf16_lite", f8f8bf16_lite);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
+  m.impl("f8i4bf16_shuffled_grouped", f8i4bf16_shuffled_grouped);
   m.impl("preshuffle_i4", preshuffle_i4);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise);
@@ -322,6 +338,7 @@ TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
   m.impl("f8f8bf16_lite", f8f8bf16_lite);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
+  m.impl("f8i4bf16_shuffled_grouped", f8i4bf16_shuffled_grouped);
   m.impl("preshuffle_i4", preshuffle_i4);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise);
@@ -444,8 +461,11 @@ at::Tensor bf16fp8bf16_fast_gemv_meta(
   return Y;
 }
 
-at::Tensor
-fp8fp8bf16_fast_gemv_meta(at::Tensor X, at::Tensor W, at::Tensor /* scale */) {
+at::Tensor fp8fp8bf16_fast_gemv_meta(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor /* x_scale */,
+    at::Tensor /* w_scale */) {
   const at::SymInt M = X.sym_size(0);
   const at::SymInt N = W.sym_size(0);
   auto Y = at::empty_symint({M, N}, X.options().dtype(at::kBFloat16));

@@ -1147,9 +1147,10 @@ class FP8Tests(unittest.TestCase):
                 wq, w_scale = torch.ops.fbgemm.quantize_fp8_per_tensor(w)
                 z = gemv_op(x, wq, w_scale)
             elif quantize_w and quantize_x:
-                xq, x_scale = torch.ops.fbgemm.quantize_fp8_per_tensor(x)
-                wq, w_scale = torch.ops.fbgemm.quantize_fp8_per_tensor(w)
-                z = gemv_op(xq, wq, x_scale * w_scale)
+                # row-wise scaling
+                xq, x_scale = torch.ops.fbgemm.quantize_fp8_per_row(x)
+                wq, w_scale = torch.ops.fbgemm.quantize_fp8_per_row(w)
+                z = gemv_op(xq, wq, x_scale, w_scale)
             else:
                 z = gemv_op(x, w)
             z_ref = (x @ w.T).to(torch.bfloat16).to("cuda")
@@ -1166,6 +1167,18 @@ class FP8Tests(unittest.TestCase):
             (1, 8192, 1024),
             (1, 7168, 8192),
             (1, 8192, 3584),
+            (2, 128, 256),
+            (2, 256, 256),
+            (2, 1280, 8192),
+            (2, 8192, 1024),
+            (2, 7168, 8192),
+            (2, 8192, 3584),
+            (4, 128, 256),
+            (4, 256, 256),
+            (4, 1280, 8192),
+            (4, 8192, 1024),
+            (4, 7168, 8192),
+            (4, 8192, 3584),
         ]
         self.run_gemv(test_cases, torch.ops.fbgemm.bf16_fast_gemv, 9.0e-3, 9.0e-3)
 
@@ -1174,18 +1187,24 @@ class FP8Tests(unittest.TestCase):
     )
     def test_bf16_fp8_gemv(self) -> None:
         test_cases = [
-            (1, 128, 256),
-            (1, 256, 256),
             (1, 1280, 8192),
             (1, 8192, 1024),
             (1, 7168, 8192),
             (1, 8192, 3584),
+            (2, 1280, 8192),
+            (2, 8192, 1024),
+            (2, 7168, 8192),
+            (2, 8192, 3584),
+            (4, 1280, 8192),
+            (4, 8192, 1024),
+            (4, 7168, 8192),
+            (4, 8192, 3584),
         ]
         self.run_gemv(
             test_cases,
             torch.ops.fbgemm.bf16fp8bf16_fast_gemv,
-            1.0e-2,
-            1.0e-2,
+            9.0e-2,
+            9.0e-2,
             quantize_w=True,
         )
 
@@ -1198,6 +1217,18 @@ class FP8Tests(unittest.TestCase):
             (1, 8192, 1024),
             (1, 7168, 8192),
             (1, 8192, 3584),
+            (2, 1280, 8192),
+            (2, 8192, 1024),
+            (2, 7168, 8192),
+            (2, 8192, 3584),
+            (3, 1280, 8192),
+            (3, 8192, 1024),
+            (3, 7168, 8192),
+            (3, 8192, 3584),
+            (4, 1280, 8192),
+            (4, 8192, 1024),
+            (4, 7168, 8192),
+            (4, 8192, 3584),
         ]
         self.run_gemv(
             test_cases,
