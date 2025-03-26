@@ -19,8 +19,6 @@
 #include <cutlass/epilogue/collective/collective_builder.hpp> // @manual
 // clang-format on
 
-#include "cutlass_extensions/include/kernel_mode.h"
-
 namespace fbgemm_gpu {
 
 #if CUDART_VERSION >= 12000
@@ -66,7 +64,7 @@ __global__ void set_kernel_args_kernel(
   // Each kernel annoyingly can only set the kernel args for one group.
   // This could only be avoided with complicated memory management.
   if (idx == 0) {
-    problem_shape_ptr[i] = ProblemShape(M, N, K);
+    problem_shape_ptr[i] = ProblemShape(N, M, K);
     xq_ptr[i] = xq;
     wq_ptr[i] = wq;
     x_scale_ptr[i] = x_scale;
@@ -77,7 +75,7 @@ __global__ void set_kernel_args_kernel(
     stride_b_ptr[i] =
         cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
     stride_c_ptr[i] =
-        cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(N, M, 1));
   }
 }
 
@@ -109,32 +107,16 @@ __global__ void set_dynamic_kernel_args_kernel(
     StrideA* stride_a_ptr,
     StrideB* stride_b_ptr,
     StrideC* stride_c_ptr,
-    std::optional<int64_t*> zero_start_index_M,
-    std::optional<int64_t*> M_sizes) {
+    int64_t* zero_start_index_M) {
   uint32_t group_index = blockIdx.x * blockDim.x + threadIdx.x;
   // If this thread corresponds to a valid group, write kernel args to device
   // memory.
   if (group_index < G) {
     // Compute shape for this group.
-    int offset_M;
-    int kernel_M;
-    if (zero_start_index_M.has_value()) {
-      // For inputs with padding, M is fixed and the number of rows
-      // to operate on is available in zero_start_index_M.
-      kernel_M = zero_start_index_M.value()[group_index];
-      offset_M = group_index * M;
-    } else {
-      // M for this group is pulled directly from M_sizes.
-      kernel_M = M_sizes.value()[group_index];
-      // We compute the offset by getting the cumulative sum over
-      // prior groups.
-      offset_M = 0;
-      for (int i = 0; i < group_index; i++) {
-        offset_M += M_sizes.value()[i];
-      }
-    }
+    int kernel_M = zero_start_index_M[group_index];
+    int offset_M = group_index * M;
     // Set the problem shape for this group.
-    problem_shape_ptr[group_index] = ProblemShape(kernel_M, N, K);
+    problem_shape_ptr[group_index] = ProblemShape(N, kernel_M, K);
     // Set input pointers.
     xq_ptr[group_index] = xq + (offset_M * K);
     wq_ptr[group_index] = wq + (group_index * N * K);
@@ -146,7 +128,83 @@ __global__ void set_dynamic_kernel_args_kernel(
     stride_b_ptr[group_index] =
         cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
     stride_c_ptr[group_index] = cutlass::make_cute_packed_stride(
-        StrideC{}, cute::make_shape(kernel_M, N, 1));
+        StrideC{}, cute::make_shape(N, kernel_M, 1));
+  }
+}
+
+template <
+    typename ProblemShape,
+    typename ElementA,
+    typename ElementB,
+    typename ElementC,
+    typename ElementComputeEpilogue,
+    typename StrideA,
+    typename StrideB,
+    typename StrideC>
+__global__ void set_stacked_kernel_args_kernel(
+    int G,
+    int N,
+    int K,
+    ProblemShape* problem_shape_ptr,
+    ElementA* xq,
+    const ElementA** xq_ptr,
+    ElementB* wq,
+    const ElementB** wq_ptr,
+    ElementComputeEpilogue* x_scale,
+    const ElementComputeEpilogue** x_scale_ptr,
+    ElementComputeEpilogue* w_scale,
+    const ElementComputeEpilogue** w_scale_ptr,
+    ElementC* output,
+    ElementC** output_ptr,
+    StrideA* stride_a_ptr,
+    StrideB* stride_b_ptr,
+    StrideC* stride_c_ptr,
+    int64_t* M_sizes) {
+  uint32_t group_index = blockIdx.x * blockDim.x + threadIdx.x;
+  // If this thread corresponds to a valid group, write kernel args to device
+  // memory.
+  if (group_index < G) {
+    // Its possible that we're only writing a subset of the groups to
+    // kernel args. To do this, we need to set all groups initially to empty.
+    // and keep a problem counter for the number of non-empty groups.
+    __shared__ int non_zero_counter;
+    // Initialize counter in first group.
+    if (group_index == 0) {
+      non_zero_counter = 0;
+    }
+    // Set problem shapes to empty by default.
+    problem_shape_ptr[group_index] = ProblemShape(0, 0, 0);
+    // Sync threads to get consistent state in the block.
+    __syncthreads();
+
+    // Compute shape for this group.
+    // M for this group is pulled directly from M_sizes.
+    int M = M_sizes[group_index];
+    // Only proceed to writing kernel args if this group is non-empty.
+    if (M > 0) {
+      // Get the index for this group atomically.
+      int non_zero_idx = atomicAdd(&non_zero_counter, 1);
+      // We compute the offset by getting the cumulative sum over
+      // prior groups.
+      int offset_M = 0;
+      for (int i = 0; i < group_index; i++) {
+        offset_M += M_sizes[i];
+      }
+      // Set the problem shape for this group.
+      problem_shape_ptr[non_zero_idx] = ProblemShape(N, M, K);
+      // Set input pointers.
+      xq_ptr[non_zero_idx] = xq + (offset_M * K);
+      wq_ptr[non_zero_idx] = wq + (group_index * N * K);
+      x_scale_ptr[non_zero_idx] = x_scale + offset_M;
+      w_scale_ptr[non_zero_idx] = w_scale + (group_index * N);
+      output_ptr[non_zero_idx] = output + (offset_M * N);
+      stride_a_ptr[non_zero_idx] = cutlass::make_cute_packed_stride(
+          StrideA{}, cute::make_shape(M, K, 1));
+      stride_b_ptr[non_zero_idx] = cutlass::make_cute_packed_stride(
+          StrideB{}, cute::make_shape(N, K, 1));
+      stride_c_ptr[non_zero_idx] = cutlass::make_cute_packed_stride(
+          StrideC{}, cute::make_shape(N, M, 1));
+    }
   }
 }
 
@@ -180,6 +238,8 @@ at::Tensor f8f8bf16_rowwise_grouped_impl(
     G = WQ.size(0);
     options = XQ.options();
   }
+  // The number of groups the kernel uses may vary.
+  int kernel_groups = G;
   // Return early if there are no elements in the output.
   if (output.numel() == 0) {
     return output;
@@ -194,6 +254,10 @@ at::Tensor f8f8bf16_rowwise_grouped_impl(
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
   using LayoutC = cutlass::layout::RowMajor;
+  using LayoutA_Transpose =
+      typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+  using LayoutB_Transpose =
+      typename cutlass::layout::LayoutTranspose<LayoutB>::type;
   using ElementAccumulator = float;
   using ElementComputeEpilogue = float;
   using ArchTag = cutlass::arch::Sm90;
@@ -263,10 +327,10 @@ at::Tensor f8f8bf16_rowwise_grouped_impl(
           ElementAccumulator,
           ElementAccumulator,
           void, // Indicate there is no beta scaling to save register space.
-          LayoutC*,
+          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
           128 / cutlass::sizeof_bits<ElementC>::value,
           ElementC,
-          LayoutC*,
+          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
           128 / cutlass::sizeof_bits<ElementC>::value,
           EpilogueSchedule,
           EpilogueEVT>::CollectiveOp;
@@ -275,11 +339,11 @@ at::Tensor f8f8bf16_rowwise_grouped_impl(
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
           OperatorClass,
-          ElementA,
-          LayoutA*,
-          128 / cutlass::sizeof_bits<ElementA>::value,
           ElementB,
-          LayoutB*,
+          LayoutB_Transpose*,
+          128 / cutlass::sizeof_bits<ElementA>::value,
+          ElementA,
+          LayoutA_Transpose*,
           128 / cutlass::sizeof_bits<ElementB>::value,
           ElementAccumulator,
           TileShape,
@@ -419,49 +483,68 @@ at::Tensor f8f8bf16_rowwise_grouped_impl(
     int M = XQ.size(XQ.dim() - 2);
     int N = WQ.size(1);
     int K = WQ.size(2);
-    std::optional<int64_t*> zero_start_index_M_ptr = std::nullopt;
-    std::optional<int64_t*> M_sizes_ptr = std::nullopt;
     if (zero_start_index_M.has_value()) {
-      zero_start_index_M_ptr =
+      int64_t* zero_start_index_M_ptr =
           reinterpret_cast<int64_t*>(zero_start_index_M.value().data_ptr());
+      set_dynamic_kernel_args_kernel<<<1, G, 0, stream>>>(
+          G,
+          M,
+          N,
+          K,
+          problem_shape_ptr,
+          reinterpret_cast<ElementA*>(XQ.data_ptr()),
+          xq_ptr,
+          reinterpret_cast<ElementB*>(WQ.data_ptr()),
+          wq_ptr,
+          reinterpret_cast<ElementComputeEpilogue*>(x_scale.data_ptr()),
+          x_scale_ptr,
+          reinterpret_cast<ElementComputeEpilogue*>(w_scale.data_ptr()),
+          w_scale_ptr,
+          reinterpret_cast<ElementC*>(output.data_ptr()),
+          output_ptr,
+          stride_a_ptr,
+          stride_b_ptr,
+          stride_c_ptr,
+          zero_start_index_M_ptr);
+    } else {
+      int64_t* M_sizes_ptr =
+          reinterpret_cast<int64_t*>(M_sizes.value().data_ptr());
+      set_stacked_kernel_args_kernel<<<1, G, 0, stream>>>(
+          G,
+          N,
+          K,
+          problem_shape_ptr,
+          reinterpret_cast<ElementA*>(XQ.data_ptr()),
+          xq_ptr,
+          reinterpret_cast<ElementB*>(WQ.data_ptr()),
+          wq_ptr,
+          reinterpret_cast<ElementComputeEpilogue*>(x_scale.data_ptr()),
+          x_scale_ptr,
+          reinterpret_cast<ElementComputeEpilogue*>(w_scale.data_ptr()),
+          w_scale_ptr,
+          reinterpret_cast<ElementC*>(output.data_ptr()),
+          output_ptr,
+          stride_a_ptr,
+          stride_b_ptr,
+          stride_c_ptr,
+          M_sizes_ptr);
+      // Set the number of groups to the kernel to be at most the number of
+      // non-zero rows.
+      kernel_groups = std::min(M, G);
     }
-    if (M_sizes.has_value()) {
-      M_sizes_ptr = reinterpret_cast<int64_t*>(M_sizes.value().data_ptr());
-    }
-    set_dynamic_kernel_args_kernel<<<1, G, 0, stream>>>(
-        G,
-        M,
-        N,
-        K,
-        problem_shape_ptr,
-        reinterpret_cast<ElementA*>(XQ.data_ptr()),
-        xq_ptr,
-        reinterpret_cast<ElementB*>(WQ.data_ptr()),
-        wq_ptr,
-        reinterpret_cast<ElementComputeEpilogue*>(x_scale.data_ptr()),
-        x_scale_ptr,
-        reinterpret_cast<ElementComputeEpilogue*>(w_scale.data_ptr()),
-        w_scale_ptr,
-        reinterpret_cast<ElementC*>(output.data_ptr()),
-        output_ptr,
-        stride_a_ptr,
-        stride_b_ptr,
-        stride_c_ptr,
-        zero_start_index_M_ptr,
-        M_sizes_ptr);
   }
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGrouped,
-      {G, problem_shape_ptr, nullptr},
-      {xq_ptr, stride_a_ptr, wq_ptr, stride_b_ptr},
+      {kernel_groups, problem_shape_ptr, nullptr},
+      {wq_ptr, stride_b_ptr, xq_ptr, stride_a_ptr},
       {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr}};
 
   arguments.epilogue.thread = {
-      {x_scale_ptr}, // x_scale
+      {w_scale_ptr}, // x_scale
       // compute_0
       {
-          {w_scale_ptr}, // w_scale
+          {x_scale_ptr}, // w_scale
           {}, // Accumulator
           {} // Multiplies
       },
@@ -505,6 +588,7 @@ at::Tensor f8f8bf16_rowwise_grouped_impl(
 // FP8 Tensorwise grouped cutlass kernel dispatch.
 template <typename InputType>
 at::Tensor dispatch_fp8_grouped_kernel(
+    int total_M,
     InputType XQ, // FP8
     InputType WQ, // FP8
     InputType x_scale,
@@ -512,22 +596,52 @@ at::Tensor dispatch_fp8_grouped_kernel(
     at::Tensor output,
     std::optional<at::Tensor> zero_start_index_M = std::nullopt,
     std::optional<at::Tensor> M_sizes = std::nullopt) {
-  KernelMode kernel = get_grouped_kernel_mode(XQ, WQ);
-  if (kernel == KernelMode::Small) {
+  // Use heuristics to pick best kernel implementation.
+  if (total_M <= 16) {
     return f8f8bf16_rowwise_grouped_impl<
         InputType,
+        128,
+        16,
+        128,
+        1,
+        1,
+        1,
+        false>(XQ, WQ, x_scale, w_scale, output, zero_start_index_M, M_sizes);
+  } else if (total_M <= 32) {
+    return f8f8bf16_rowwise_grouped_impl<
+        InputType,
+        128,
+        32,
+        128,
+        1,
+        1,
+        1,
+        false>(XQ, WQ, x_scale, w_scale, output, zero_start_index_M, M_sizes);
+  } else if (total_M <= 64) {
+    return f8f8bf16_rowwise_grouped_impl<
+        InputType,
+        128,
         64,
         128,
-        128,
-        2,
         1,
         1,
-        true>(XQ, WQ, x_scale, w_scale, output, zero_start_index_M, M_sizes);
-  } else if (kernel == KernelMode::Large) {
+        1,
+        false>(XQ, WQ, x_scale, w_scale, output, zero_start_index_M, M_sizes);
+  } else if (total_M <= 128) {
     return f8f8bf16_rowwise_grouped_impl<
         InputType,
         128,
+        128,
+        128,
+        1,
+        1,
+        1,
+        false>(XQ, WQ, x_scale, w_scale, output, zero_start_index_M, M_sizes);
+  } else if (total_M <= 512) {
+    return f8f8bf16_rowwise_grouped_impl<
+        InputType,
         256,
+        128,
         128,
         2,
         1,
@@ -538,7 +652,7 @@ at::Tensor dispatch_fp8_grouped_kernel(
         InputType,
         128,
         256,
-        64,
+        128,
         2,
         1,
         1,
@@ -570,12 +684,13 @@ OutputType _f8f8bf16_rowwise_grouped(
   Y = at::empty(total_output_size, XQ[0].options().dtype(at::kBFloat16));
 
   // Run kernel.
-  at::Tensor g_out =
-      dispatch_fp8_grouped_kernel<at::TensorList>(XQ, WQ, x_scale, w_scale, Y);
+  at::Tensor g_out = dispatch_fp8_grouped_kernel<at::TensorList>(
+      total_M, XQ, WQ, x_scale, w_scale, Y);
 
   // Return appropriate output type.
   if constexpr (std::is_same_v<OutputType, at::Tensor>) {
-    return g_out.view({total_M, -1});
+    int N = WQ[0].size(0);
+    return g_out.view({total_M, N});
   } else {
     // Return grouped view of output.
     std::vector<at::Tensor> output_group = g_out.split(output_sizes);
@@ -625,7 +740,7 @@ at::Tensor f8f8bf16_rowwise_grouped_stacked(
   }
   // Return continuous view of output.
   at::Tensor out = dispatch_fp8_grouped_kernel<at::Tensor>(
-      XQ, WQ, x_scale, w_scale, Y, std::nullopt, M_sizes);
+      total_M, XQ, WQ, x_scale, w_scale, Y, std::nullopt, M_sizes);
   return out.view({total_M, N});
 }
 
@@ -653,9 +768,9 @@ at::Tensor f8f8bf16_rowwise_grouped_dynamic(
 
   // Return continuous view of output.
   at::Tensor output = dispatch_fp8_grouped_kernel<at::Tensor>(
-      XQ, WQ, x_scale, w_scale, Y, zero_start_index_M);
+      G * M, XQ, WQ, x_scale, w_scale, Y, zero_start_index_M);
   // View as proper shape.
-  return output.view({-1, M, N});
+  return output.view({G, M, N});
 }
 
 #else

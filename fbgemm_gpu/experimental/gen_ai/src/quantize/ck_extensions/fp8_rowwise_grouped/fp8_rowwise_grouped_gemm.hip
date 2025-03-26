@@ -210,27 +210,55 @@ __global__ void set_kernel_args_m_sizes_kernel(
   int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
   // Each thread is responsible for setting up the arguments for one group.
   if (thread_idx < group_count) {
+    // In cases where M < G, we want to only set M groups since the rest are empty.
+    // To do this, we use a counter into the group argument tensor.
+    __shared__ int non_zero_counter;
+    // Initialize the counter in the first thread.
+    if (thread_idx == 0) {
+      non_zero_counter = 0;
+    }
+    // We need to set a default argument for all M groups.
+    KernelArguments default_group_args = {
+      XQ,
+      WQ,
+      {w_scale, x_scale},
+      output,
+      0,
+      0,
+      0,
+      0,
+      0,
+      {0, 0},
+      0};
+    kernel_args[thread_idx] = default_group_args;
+    // Sync threads to get consistent state.
+    __syncthreads();
     // Get M information for this group.
     int kernel_M = M_sizes[thread_idx];
-    int offset_M = 0;
-    // Offset is computed by finding the sum of previous group Ms.
-    for (int i = 0; i < thread_idx; i++) {
-      offset_M += M_sizes[i];
+    // Only write actual group information if this group is nonzero.
+    if (kernel_M > 0) {
+      // Get index automatically for this group.
+      int non_zero_idx = atomicAdd(&non_zero_counter, 1);
+      int offset_M = 0;
+      // Offset is computed by finding the sum of previous group Ms.
+      for (int i = 0; i < thread_idx; i++) {
+        offset_M += M_sizes[i];
+      }
+      KernelArguments kernel_group_args = {
+          XQ + (offset_M * K),
+          WQ + (thread_idx * N * K),
+          {w_scale + (thread_idx * N), x_scale + offset_M},
+          output + (offset_M * N),
+          kernel_M,
+          N,
+          K,
+          K,
+          K,
+          {0, 0},
+          N};
+      // Write kernel args to memory.
+      kernel_args[non_zero_idx] = kernel_group_args;
     }
-    KernelArguments kernel_group_args = {
-        XQ + (offset_M * K),
-        WQ + (thread_idx * N * K),
-        {w_scale + (thread_idx * N), x_scale + offset_M},
-        output + (offset_M * N),
-        kernel_M,
-        N,
-        K,
-        K,
-        K,
-        {0, 0},
-        N};
-    // Write kernel args to memory.
-    kernel_args[thread_idx] = kernel_group_args;
   }
 }
 
@@ -488,7 +516,8 @@ OutputType _f8f8bf16_rowwise_grouped(
   at::Tensor g_out = selected_kernel(XQ, WQ, x_scale, w_scale, kernel_args, Y);
   // Get output in appropriate format.
   if constexpr (std::is_same_v<OutputType, at::Tensor>) {
-    return g_out.view({total_M, -1});
+    int N = WQ[0].size(0);
+    return g_out.view({total_M, N});
   } else {
     std::vector<at::Tensor> output_groups = g_out.split(output_sizes);
     for (int i = 0; i < group_count; i++) {
@@ -616,6 +645,11 @@ at::Tensor f8f8bf16_rowwise_grouped_dynamic(
   // of kernel setup.
   at::Tensor Y =
       at::empty({group_count, M, N}, XQ.options().dtype(at::kBFloat16));
+
+  // Early exit for empty input.
+  if (Y.numel() == 0) {
+    return Y;
+  }
 
   // Prepare kernel arguments by copying them to the proper device location.
   at::Tensor kernel_args = at::empty(
