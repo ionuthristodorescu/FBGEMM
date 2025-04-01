@@ -119,6 +119,7 @@ set(fbgemm_sources_include_directories
   ${THIRDPARTY}/cpuinfo/include
   ${THIRDPARTY}/cutlass/include
   ${THIRDPARTY}/cutlass/tools/util/include
+  ${THIRDPARTY}/composable_kernel/include
   ${THIRDPARTY}/json/include
   ${NCCL_INCLUDE_DIRS})
 
@@ -253,5 +254,4 @@ if(FBGEMM_GENAI_ONLY)
 else()
   # Build FBGEMM_GPU
   include(FbgemmGpu.cmake)
-
 endif()
