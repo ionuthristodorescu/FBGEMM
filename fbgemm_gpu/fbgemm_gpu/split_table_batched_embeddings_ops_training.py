@@ -604,6 +604,11 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         embedding_table_offset_type (torch.dtype = torch.int64): The data type of
             the embedding table offset tensor. Options are `torch.int32` and
             `torch.int64`
+
+        embedding_shard_info (Optional[List[Tuple[int, int, int, int]]] = None): the
+            information about shard position and pre-sharded table size. If not set,
+            the table is not sharded.
+            (preshard_table_height, preshard_table_dim, height_offset, dim_offset)
     """
 
     embedding_specs: List[Tuple[int, int, EmbeddingLocation, ComputeDevice]]
@@ -674,6 +679,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         tbe_input_multiplexer_config: Optional[TBEInputMultiplexerConfig] = None,
         embedding_table_index_type: torch.dtype = torch.int64,
         embedding_table_offset_type: torch.dtype = torch.int64,
+        embedding_shard_info: Optional[List[Tuple[int, int, int, int]]] = None,
     ) -> None:
         super(SplitTableBatchedEmbeddingBagsCodegen, self).__init__()
         self.uuid = str(uuid.uuid4())
@@ -716,16 +722,6 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             # See:
             #   https://fb.workplace.com/groups/fbgemmusers/permalink/9438488366231860/
             cache_precision = SparseType.FP32
-            self.log("Override cache_precision=SparseType.FP32 on ROCm")
-
-            # NOTE: Use bounds_check_indices v2 on ROCm because ROCm has a
-            # constraint that the gridDim * blockDim has to be smaller than
-            # 2^32. The v1 kernel can be launched with gridDim * blockDim >
-            # 2^32 while the v2 kernel limits the gridDim size to 64 * # of
-            # SMs.  Thus, its gridDim * blockDim is guaranteed to be smaller
-            # than 2^32
-            self.bounds_check_version = 2
-            self.log("Override bounds_check_version=2 on ROCm")
         else:
             # NOTE: The changes from D65865527 are retained here until we can
             # test that the the hack also works for non-ROCm environments.
@@ -878,6 +874,16 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             feature_table_map if feature_table_map is not None else list(range(T_))
         )
 
+        if embedding_shard_info:
+            (full_table_heights, full_table_dims, row_offset, col_offset) = zip(
+                *embedding_shard_info
+            )
+        else:
+            # Just assume the table is unsharded
+            full_table_heights = rows
+            full_table_dims = dims
+            row_offset = [0] * len(rows)
+            col_offset = [0] * len(rows)
         self.tbe_input_multiplexer: Optional[TBEInputMultiplexer] = (
             tbe_input_multiplexer_config.create_tbe_input_multiplexer(
                 tbe_info=TBEInfo(
@@ -889,6 +895,11 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                     table_heights=rows,
                     tbe_uuid=self.uuid,
                     feature_table_map=self.feature_table_map,
+                    table_dims=dims,
+                    full_table_heights=full_table_heights,
+                    full_table_dims=full_table_dims,
+                    row_offset=row_offset,
+                    col_offset=col_offset,
                 )
             )
             if tbe_input_multiplexer_config is not None
